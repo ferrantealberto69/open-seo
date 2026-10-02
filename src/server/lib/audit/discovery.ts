@@ -4,7 +4,7 @@
 import robotsParser from "robots-parser";
 import { XMLParser } from "fast-xml-parser";
 import { isSameOrigin, normalizeUrl } from "./url-utils";
-import { isCrawlableUrl } from "./url-policy";
+import { isFetchableUrl } from "./url-policy";
 import { crawlerHeadersFor, type CrawlerAccess } from "@/shared/crawler-access";
 
 const SITEMAP_FETCH_TIMEOUT_MS = 15_000;
@@ -73,6 +73,9 @@ async function fetchFollowingRedirects(
   const deadline = Date.now() + timeoutMs;
   let current = url;
   for (let hop = 0; hop <= MAX_DISCOVERY_REDIRECT_HOPS; hop++) {
+    // Sitemap URLs (from robots.txt or sitemap indexes) and redirect targets
+    // can name any host, so every hop gets the DNS-checked SSRF policy.
+    if (!(await isFetchableUrl(current))) return null;
     const response = await fetch(current, {
       headers: {
         "User-Agent": "OpenSEO-Audit/1.0",
@@ -96,7 +99,6 @@ async function fetchFollowingRedirects(
     } catch {
       return null;
     }
-    if (!isCrawlableUrl(next)) return null;
     current = next;
   }
   return null;

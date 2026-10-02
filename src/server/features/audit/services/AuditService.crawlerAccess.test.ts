@@ -98,9 +98,13 @@ describe("startAudit crawler access", () => {
       vi.fn().mockImplementation((url: string) =>
         Promise.resolve(
           String(url).includes("dns-query")
-            ? new Response(JSON.stringify({ Status: 0, Answer: [] }), {
-                status: 200,
-              })
+            ? new Response(
+                JSON.stringify({
+                  Status: 0,
+                  Answer: [{ type: 1, data: "93.184.215.14" }],
+                }),
+                { status: 200 },
+              )
             : new Response(null, {
                 status: 200,
                 headers: { "powered-by": "Shopify" },

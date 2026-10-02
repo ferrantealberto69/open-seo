@@ -15,6 +15,8 @@ const BLOCKED_HOST_SUFFIXES = [
   ".localdomain",
   ".internal",
   ".home.arpa",
+  ".lan",
+  ".intranet",
 ];
 
 const DOH_ENDPOINT = "https://cloudflare-dns.com/dns-query";
@@ -53,15 +55,20 @@ function isPrivateIpv4(host: string): boolean {
   if (a === 192 && b === 168) return true;
   if (a === 100 && b >= 64 && b <= 127) return true;
   if (a === 198 && (b === 18 || b === 19)) return true;
+  // IETF protocol assignments (192.0.0.0/24).
+  if (a === 192 && b === 0 && parts[2] === 0) return true;
   if (a >= 224) return true;
   return false;
 }
 
-function parseMappedIpv4FromIpv6(host: string): string | null {
+function parseMappedIpv4FromIpv6(
+  host: string,
+  prefix = "::ffff:",
+): string | null {
   const normalized = normalizeHost(host);
-  if (!normalized.startsWith("::ffff:")) return null;
+  if (!normalized.startsWith(prefix)) return null;
 
-  const mapped = normalized.slice("::ffff:".length);
+  const mapped = normalized.slice(prefix.length);
   if (/^\d+\.\d+\.\d+\.\d+$/.test(mapped)) {
     return mapped;
   }
@@ -93,6 +100,10 @@ function isPrivateIpv6(host: string): boolean {
   const value = normalizeHost(host);
   if (value === "::1" || value === "::") return true;
   if (value.startsWith("fc") || value.startsWith("fd")) return true;
+  // Multicast, and NAT64 addresses embedding a private IPv4.
+  if (value.startsWith("ff")) return true;
+  const nat64Ipv4 = parseMappedIpv4FromIpv6(value, "64:ff9b::");
+  if (nat64Ipv4 && isPrivateIpv4(nat64Ipv4)) return true;
   if (
     value.startsWith("fe8") ||
     value.startsWith("fe9") ||
@@ -126,6 +137,11 @@ function isBlockedHost(hostname: string): boolean {
   if (isIpLiteral(host)) {
     return isPrivateIpv4(host) || isPrivateIpv6(host);
   }
+
+  // Single-label names ("openseo", "core-api", "db") never identify a public
+  // website; inside Docker/Kubernetes they resolve to sibling services
+  // through the platform's internal DNS, which a public DoH lookup can't see.
+  if (!host.includes(".")) return true;
 
   return false;
 }
@@ -164,35 +180,88 @@ async function resolveAddressRecords(
   ).map((answer) => normalizeHost(answer.data));
 }
 
-async function hostnameResolvesToBlockedAddress(
-  hostname: string,
-): Promise<boolean> {
+/** Resolves a hostname to its A + AAAA addresses. */
+export type HostAddressResolver = (hostname: string) => Promise<string[]>;
+
+/**
+ * Default resolver: DNS-over-HTTPS. The workerd runtime that serves the
+ * self-hosted build exposes no system resolver API to application code
+ * (node:dns in workerd is itself DoH-backed), so DoH is the only lookup
+ * available here. Because the platform's own DNS (e.g. Docker's 127.0.0.11)
+ * may know names that public DNS does not, an empty or failed answer is
+ * treated as NOT public (fail closed) — see hostnameIsNotPublic.
+ */
+const dohResolver: HostAddressResolver = async (hostname) => {
+  const [v4, v6] = await Promise.all([
+    resolveAddressRecords(hostname, "A"),
+    resolveAddressRecords(hostname, "AAAA"),
+  ]);
+  return [...v4, ...v6];
+};
+
+let hostAddressResolver: HostAddressResolver = dohResolver;
+
+/** Test hook: swap the resolver (null restores DoH) and clear the cache. */
+export function setHostAddressResolverForTesting(
+  resolver: HostAddressResolver | null,
+): void {
+  hostAddressResolver = resolver ?? dohResolver;
+  verdictCache.clear();
+}
+
+const VERDICT_TTL_MS = 60_000;
+const VERDICT_CACHE_MAX = 1_000;
+const verdictCache = new Map<string, { blocked: boolean; at: number }>();
+
+/**
+ * True unless the hostname resolves, and resolves ONLY to public addresses.
+ * Fails closed: no answer, NXDOMAIN, resolver errors and timeouts all count
+ * as not public, so names known only to an internal resolver can't slip
+ * through just because public DNS has never heard of them.
+ */
+async function hostnameIsNotPublic(hostname: string): Promise<boolean> {
   const host = normalizeHost(hostname);
-  if (!host || isIpLiteral(host)) return false;
+  if (!host) return true;
+  if (isIpLiteral(host)) return isPrivateIpv4(host) || isPrivateIpv6(host);
 
+  const cached = verdictCache.get(host);
+  if (cached && Date.now() - cached.at < VERDICT_TTL_MS) return cached.blocked;
+
+  let blocked: boolean;
   try {
-    const [v4, v6] = await Promise.all([
-      resolveAddressRecords(host, "A"),
-      resolveAddressRecords(host, "AAAA"),
-    ]);
-
-    const addresses = [...v4, ...v6];
-    if (addresses.length === 0) return false;
-
-    return addresses.some(
-      (address) => isPrivateIpv4(address) || isPrivateIpv6(address),
-    );
+    const addresses = await hostAddressResolver(host);
+    blocked =
+      addresses.length === 0 ||
+      addresses.some(
+        (address) => isPrivateIpv4(address) || isPrivateIpv6(address),
+      );
   } catch {
-    return false;
+    blocked = true;
   }
+
+  if (verdictCache.size >= VERDICT_CACHE_MAX) verdictCache.clear();
+  verdictCache.set(host, { blocked, at: Date.now() });
+  return blocked;
+}
+
+/**
+ * Async SSRF check for any URL about to be fetched from a host that was not
+ * validated as the audit's start origin (sitemaps, robots.txt redirect hops):
+ * the synchronous policy plus a DNS check that every resolved address is
+ * public. Verdicts are cached per hostname for a minute.
+ */
+export async function isFetchableUrl(url: string): Promise<boolean> {
+  if (!isCrawlableUrl(url)) return false;
+  return !(await hostnameIsNotPublic(new URL(url).hostname));
 }
 
 /**
  * Synchronous SSRF check for URLs discovered mid-crawl (links, redirect
  * targets, sitemap entries). Blocks non-http(s) schemes, private/loopback IP
- * literals, and internal hostnames. DNS resolution is only performed for the
- * start URL (see normalizeAndValidateStartUrl); per-link DoH lookups would be
- * prohibitively slow.
+ * literals, single-label and internal hostnames. Crawled pages are always
+ * same-origin as the start URL, whose DNS was checked by
+ * normalizeAndValidateStartUrl; fetches that may leave the origin (sitemaps,
+ * robots.txt redirects) use the DNS-checking isFetchableUrl instead.
  */
 export function isCrawlableUrl(url: string): boolean {
   let parsed: URL;
@@ -232,7 +301,7 @@ export async function normalizeAndValidateStartUrl(
     throw new AppError("CRAWL_TARGET_BLOCKED");
   }
 
-  if (await hostnameResolvesToBlockedAddress(parsed.hostname)) {
+  if (await hostnameIsNotPublic(parsed.hostname)) {
     throw new AppError("CRAWL_TARGET_BLOCKED");
   }
 
